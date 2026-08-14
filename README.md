@@ -1,5 +1,25 @@
 # CodexBar Cinnamon Applet
 
+> **Fork variant (branch `markus-variant`):** dual-provider version showing
+> **Claude and Codex** as two concentric panel gauges. Claude usage comes from
+> [claude-usage-tray](https://pypi.org/project/claude-usage-tray/) (`pipx
+> install claude-usage-tray`), which queries Anthropic's OAuth usage API
+> directly — so it counts every client (Claude Code, Claude Desktop, editor
+> plugins), not just terminal statusline sessions. The applet runs
+> `claude-usage --cli` on each refresh and reads its JSON cache at
+> `~/.claude/usage-monitor-cache.json`. It never touches
+> `~/.claude/.credentials.json` itself; the tool handles the token.
+>
+> Other changes vs. upstream: provider order Claude-first (the 5-hour window
+> is the critical one), runtime contrast detection (menu background luminance
+> is measured, text renders solid black or white — works on light and dark
+> themes), "Refresh now" keeps the menu open, tooltips include reset times,
+> and stale Claude values are shown as stale instead of silently aging.
+>
+> The text below is the original upstream README.
+
+---
+
 A Linux Mint Cinnamon panel applet for displaying Codex usage from
 [steipete/CodexBar](https://github.com/steipete/CodexBar).
 
