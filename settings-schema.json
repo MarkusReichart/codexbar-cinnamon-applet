@@ -20,14 +20,14 @@
     },
     "provider": {
         "type": "combobox",
-        "default": "codex",
+        "default": "both",
         "description": "Provider",
         "options": {
+            "Codex + Claude": "both",
             "Codex": "codex",
-            "OpenAI": "openai",
             "Claude": "claude",
-            "Gemini": "gemini",
-            "All": "all"
+            "OpenAI": "openai",
+            "Gemini": "gemini"
         }
     },
     "refresh-interval": {

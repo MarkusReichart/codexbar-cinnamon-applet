@@ -7,12 +7,43 @@ const St = imports.gi.St;
 const Util = imports.misc.util;
 const AppletManager = imports.ui.appletManager;
 const Cairo = imports.cairo;
+const GLib = imports.gi.GLib;
+const Gio = imports.gi.Gio;
 
 const DEFAULT_COMMAND = "/opt/apps/codexbar/codexbar";
-const DEFAULT_PROVIDER = "codex";
+const DEFAULT_PROVIDER = "both";
 const DEFAULT_REFRESH_SECONDS = 60;
-const PANEL_GAUGE_WIDTH = 28;
-const PANEL_GAUGE_HEIGHT = 16;
+const PANEL_GAUGE_WIDTH = 30;
+const PANEL_GAUGE_HEIGHT = 18;
+
+// Konzentrische Ringe: Abstand und Strichstaerke so gewaehlt, dass zwei Ringe
+// in einem 30x18-Panelbereich klar getrennt bleiben.
+const RING_SPACING = 4.5;
+const RING_WIDTH = 3.0;
+
+// Providerfarben: Claude im markentypischen Orange (#D97757), Codex in einem
+// klar abgesetzten Blau. Diese Farbe traegt der Fuellbogen, damit die Ringe auf
+// einen Blick zuzuordnen sind.
+const PROVIDER_TINTS = {
+    codex: [0.31, 0.60, 0.96],
+    claude: [0.85, 0.47, 0.34]
+};
+
+// Ab diesem Fuellstand wird das Bogenende zusaetzlich in Ampelfarbe markiert.
+const WARN_THRESHOLD = 0.85;
+
+// Claude-Live-Werte liefert claude-usage-tray (pipx): das Tool liest den
+// OAuth-Token aus ~/.claude/.credentials.json und fragt die Anthropic-API
+// direkt ab - damit zaehlt jeder Client (Code, Desktop, Copilot), nicht nur
+// die Terminal-Statusline. "claude-usage --cli" schreibt das Ergebnis als
+// JSON nach ~/.claude/usage-monitor-cache.json; das Applet startet den Abruf
+// und liest anschliessend diesen Cache.
+const CLAUDE_USAGE_BIN = "/.local/bin/claude-usage";
+const CLAUDE_MONITOR_CACHE_PATH = "/.claude/usage-monitor-cache.json";
+
+// Ab diesem Alter des Caches gilt der Live-Abruf als fehlgeschlagen und der
+// Ring wird halbtransparent gezeichnet.
+const CLAUDE_STALE_SECONDS = 600;
 
 class CodexBarApplet extends Applet.TextIconApplet {
     constructor(metadata, orientation, panelHeight, instanceId) {
@@ -24,6 +55,15 @@ class CodexBarApplet extends Applet.TextIconApplet {
         this.menu = new Applet.AppletPopupMenu(this, orientation);
         this.menuManager = new PopupMenu.PopupMenuManager(this);
         this.menuManager.addMenu(this.menu);
+
+        // Bei jedem Oeffnen die Helligkeit des Menuehintergrunds messen und
+        // die Kontrastklasse setzen - so stimmen die Textfarben auf hellen
+        // wie dunklen Themes, ohne dass etwas hartkodiert wird.
+        this.menu.connect("open-state-changed", Lang.bind(this, function(menu, open) {
+            if (open) {
+                this._applyContrastClass();
+            }
+        }));
 
         this.refreshTimerId = 0;
         this.refreshing = false;
@@ -60,6 +100,43 @@ class CodexBarApplet extends Applet.TextIconApplet {
         this.settings.finalize();
     }
 
+    // Liest die Hintergrundfarbe des Menues aus dem Theme-Knoten und haengt
+    // codexbar-on-light oder codexbar-on-dark an den Container. Schlaegt die
+    // Messung fehl (z. B. transparenter Hintergrund), bleibt die geerbte
+    // Theme-Farbe als Fallback.
+    _applyContrastClass() {
+        let actor = this.menu.actor;
+        if (!actor) {
+            return;
+        }
+
+        let chosen = null;
+        let targets = [actor, this.menu.box];
+
+        for (let i = 0; i < targets.length; i++) {
+            let target = targets[i];
+            if (!target) {
+                continue;
+            }
+            try {
+                let bg = target.get_theme_node().get_background_color();
+                if (bg && bg.alpha > 200) {
+                    let luminance = 0.299 * bg.red + 0.587 * bg.green + 0.114 * bg.blue;
+                    chosen = luminance > 140 ? "codexbar-on-light" : "codexbar-on-dark";
+                    break;
+                }
+            } catch (e) {
+                // naechstes Ziel probieren
+            }
+        }
+
+        actor.remove_style_class_name("codexbar-on-light");
+        actor.remove_style_class_name("codexbar-on-dark");
+        if (chosen) {
+            actor.add_style_class_name(chosen);
+        }
+    }
+
     _onSettingsChanged() {
         this.commandPath = this.commandPath || DEFAULT_COMMAND;
         this.provider = this.provider || DEFAULT_PROVIDER;
@@ -84,16 +161,51 @@ class CodexBarApplet extends Applet.TextIconApplet {
         this.records = records || [];
         this.lastUpdated = new Date();
 
-        let model = this._modelFromRecords(this.records);
-        this.lastError = model.error;
-        this._setPanelGauge(model.gaugePercent, model.error ? "error" : "normal");
-        this.set_applet_tooltip(model.tooltip);
+        let rings = [];
+        let tooltipParts = [];
+        let errors = 0;
+
+        for (let i = 0; i < this.records.length; i++) {
+            let record = this.records[i];
+            let name = record && record.provider ? record.provider : "unknown";
+            let tint = PROVIDER_TINTS[name] || null;
+
+            if (record && record.error) {
+                errors += 1;
+                rings.push({ percent: 100, mode: "error", tint: tint });
+                tooltipParts.push(this._titleCase(name) + ": " + this._errorMessage(record.error));
+                continue;
+            }
+
+            let rows = this._usageRows(record);
+            rings.push({
+                percent: this._gaugeLimitPercent(record),
+                mode: record && record.stale ? "stale" : "normal",
+                tint: tint
+            });
+            tooltipParts.push(this._tooltip(this._titleCase(name), rows, this._extraUsage(record)));
+        }
+
+        this.panelRings = rings;
+        this.lastError = errors === this.records.length && this.records.length > 0
+            ? this._errorMessage(this.records[0].error)
+            : null;
+
+        // panelPercent bleibt fuer den Einzelring-Fallback gesetzt.
+        this.panelPercent = rings.length > 0 ? rings[0].percent : 0;
+        this.panelGaugeMode = rings.length > 0 ? rings[0].mode : "loading";
+        this.panelGauge.queue_repaint();
+
+        this.set_applet_tooltip(tooltipParts.length > 0
+            ? tooltipParts.join("\n\n")
+            : "CodexBar: waiting for data");
         this._buildMenu();
     }
 
     _setErrorState(message) {
         this.lastUpdated = new Date();
         this.lastError = message || "Unknown CodexBar error";
+        this.panelRings = [{ percent: 100, mode: "error", tint: null }];
         this._setPanelGauge(100, "error");
         this.set_applet_tooltip("CodexBar: " + this.lastError);
         this._buildMenu();
@@ -108,36 +220,73 @@ class CodexBarApplet extends Applet.TextIconApplet {
     _drawPanelGauge(area) {
         let cr = area.get_context();
         let [width, height] = area.get_surface_size();
-        let percent = this.panelGaugeMode === "loading" ? 0 : this.panelPercent;
-        let ratio = Math.max(0, Math.min(1, percent / 100));
         let cx = width / 2;
         let cy = height - 2.5;
-        let radius = Math.min(width / 2 - 3, height - 4);
-        let start = Math.PI;
-        let end = Math.PI * 2;
-        let activeEnd = start + (end - start) * ratio;
+        let outerRadius = Math.min(width / 2 - 2, height - 3);
 
         cr.setLineCap(Cairo.LineCap.ROUND);
-        cr.setLineWidth(3.2);
-        cr.arc(cx, cy, radius, start, end);
-        cr.setSourceRGBA(1, 1, 1, 0.18);
-        cr.stroke();
 
-        if (this.panelGaugeMode === "error") {
-            cr.setSourceRGBA(0.95, 0.22, 0.18, 1);
-        } else if (this.panelGaugeMode === "loading") {
-            cr.setSourceRGBA(0.45, 0.65, 1, 0.8);
-        } else {
-            let color = this._usageColor(ratio);
-            cr.setSourceRGBA(color[0], color[1], color[2], 1);
+        let rings = this.panelRings || [];
+        if (rings.length === 0) {
+            rings = [{ percent: this.panelPercent, mode: this.panelGaugeMode, tint: null }];
         }
 
-        if (ratio > 0 || this.panelGaugeMode !== "normal") {
+        // Aeusserer Ring zuerst, weiter innen liegende Ringe danach. Jeder Ring
+        // bekommt einen eigenen Radius, damit sich die Boegen nicht ueberdecken.
+        for (let i = 0; i < rings.length; i++) {
+            let ring = rings[i];
+            let radius = outerRadius - i * RING_SPACING;
+            if (radius < 2) {
+                break;
+            }
+
+            this._drawRing(cr, cx, cy, radius, ring);
+        }
+
+        cr.$dispose();
+    }
+
+    _drawRing(cr, cx, cy, radius, ring) {
+        let start = Math.PI;
+        let end = Math.PI * 2;
+        let mode = ring.mode || "normal";
+        let percent = mode === "loading" ? 0 : Math.max(0, Math.min(100, Number(ring.percent || 0)));
+        let ratio = percent / 100;
+        let activeEnd = start + (end - start) * ratio;
+
+        cr.setLineWidth(RING_WIDTH);
+
+        // Grundbogen neutral grau: die Providerfarbe soll allein vom Fuellbogen
+        // kommen, sonst konkurrieren zwei Toene derselben Farbe miteinander.
+        cr.arc(cx, cy, radius, start, end);
+        cr.setSourceRGBA(0.5, 0.5, 0.5, 0.3);
+        cr.stroke();
+
+        if (mode === "error") {
+            cr.setSourceRGBA(0.95, 0.22, 0.18, 1);
+        } else if (mode === "loading") {
+            cr.setSourceRGBA(0.45, 0.65, 1, 0.8);
+        } else {
+            // Der Fuellbogen traegt die Providerfarbe, nicht die Ampelfarbe:
+            // sonst sehen beide Ringe im gruenen Bereich identisch aus und die
+            // Zuordnung Codex/Claude geht verloren.
+            let color = ring.tint || this._usageColor(ratio);
+            cr.setSourceRGBA(color[0], color[1], color[2], mode === "stale" ? 0.5 : 1);
+        }
+
+        if (ratio > 0 || mode !== "normal") {
             cr.arc(cx, cy, radius, start, Math.max(start + 0.04, activeEnd));
             cr.stroke();
         }
 
-        cr.$dispose();
+        // Auslastungswarnung als kurze Markierung am Bogenende, damit die
+        // Providerfarbe erhalten bleibt und hohe Werte trotzdem auffallen.
+        if (mode === "normal" && ratio >= WARN_THRESHOLD) {
+            let warn = this._usageColor(ratio);
+            cr.setSourceRGBA(warn[0], warn[1], warn[2], 1);
+            cr.arc(cx, cy, radius, Math.max(start, activeEnd - 0.28), activeEnd);
+            cr.stroke();
+        }
     }
 
     _usageColor(ratio) {
@@ -165,6 +314,17 @@ class CodexBarApplet extends Applet.TextIconApplet {
         }
     }
 
+    _selectedProviders() {
+        let mode = this.provider || DEFAULT_PROVIDER;
+        if (mode === "both") {
+            // Claude zuerst: das 5h-Fenster kippt mehrmals taeglich und ist
+            // damit der Wert, den man im Blick behalten muss. Codex laeuft
+            // nur einmal pro Woche ab und kommt an zweiter Stelle.
+            return ["claude", "codex"];
+        }
+        return [mode];
+    }
+
     _refresh(manual) {
         if (this.refreshing) {
             if (manual && this.menu.isOpen) {
@@ -179,79 +339,308 @@ class CodexBarApplet extends Applet.TextIconApplet {
             this._buildMenu();
         }
 
+        let providers = this._selectedProviders();
+        let collected = {};
+        let pending = providers.length;
+
+        // Beide Quellen laufen unabhaengig; erst wenn alle geantwortet haben,
+        // wird einmal gerendert. Sonst wuerde der zweite Ring den ersten
+        // ueberschreiben, sobald eine Quelle langsamer ist.
+        let finish = Lang.bind(this, function() {
+            pending -= 1;
+            if (pending > 0) {
+                return;
+            }
+
+            this.refreshing = false;
+
+            let records = [];
+            for (let i = 0; i < providers.length; i++) {
+                let record = collected[providers[i]];
+                if (record) {
+                    records.push(record);
+                }
+            }
+
+            this._setRecords(records);
+
+            if (manual) {
+                this._scheduleRefresh();
+            }
+        });
+
+        for (let i = 0; i < providers.length; i++) {
+            let name = providers[i];
+            if (name === "claude") {
+                this._readClaudeRecord(function(record) {
+                    collected[name] = record;
+                    finish();
+                });
+            } else {
+                this._readCliRecord(name, function(record) {
+                    collected[name] = record;
+                    finish();
+                });
+            }
+        }
+    }
+
+    _readCliRecord(providerName, done) {
         try {
             Util.spawnCommandLineAsyncIO(null, Lang.bind(this, function(stdout, stderr, exitCode) {
-                this.refreshing = false;
+                let output = (stdout || "").trim();
 
-                let output = stdout || "";
-                if (!output.trim() && stderr) {
-                    this._setErrorState("CodexBar failed: " + stderr.trim());
+                if (!output && stderr) {
+                    done({ provider: providerName, error: { message: "CodexBar failed: " + stderr.trim() } });
                     return;
                 }
 
                 try {
                     let parsed = JSON.parse(output || "[]");
-                    this._setRecords(Array.isArray(parsed) ? parsed : [parsed]);
+                    let list = Array.isArray(parsed) ? parsed : [parsed];
+                    done(list.length > 0 ? list[0] : { provider: providerName, error: { message: "No data returned." } });
                 } catch (e) {
-                    let suffix = stderr ? " (" + stderr.trim() + ")" : "";
-                    this._setErrorState("Could not parse CodexBar JSON: " + e.message + suffix);
-                }
-
-                if (manual) {
-                    this._scheduleRefresh();
+                    done({ provider: providerName, error: { message: "Could not parse CodexBar JSON: " + e.message } });
                 }
             }), {
                 argv: [
-                this.commandPath || DEFAULT_COMMAND,
-                "usage",
-                "--format",
-                "json",
-                "--provider",
-                this.provider || DEFAULT_PROVIDER
+                    this.commandPath || DEFAULT_COMMAND,
+                    "usage",
+                    "--format",
+                    "json",
+                    "--provider",
+                    providerName
                 ]
             });
         } catch (e) {
-            this.refreshing = false;
-            this._setErrorState("Could not run CodexBar: " + e.message);
+            done({ provider: providerName, error: { message: "Could not run CodexBar: " + e.message } });
         }
+    }
+
+    _readClaudeRecord(done) {
+        // "claude-usage --cli" holt frische Werte von der Anthropic-OAuth-API
+        // und schreibt sie in den Monitor-Cache. Die Textausgabe des Befehls
+        // ignorieren wir; gelesen wird anschliessend die Cache-Datei. So
+        // bekommt das Applet maschinenlesbares JSON statt formatierten Text.
+        let bin = GLib.get_home_dir() + CLAUDE_USAGE_BIN;
+        try {
+            Util.spawnCommandLineAsyncIO(null, Lang.bind(this, function(stdout, stderr, exitCode) {
+                let record = this._recordFromMonitorCache();
+
+                // Ein alter Cache ist besser als keiner: bei API-Fehler zeigt
+                // der Ring den letzten bekannten Stand, als stale markiert.
+                if (!record && exitCode !== 0) {
+                    record = {
+                        provider: "claude",
+                        error: { message: "claude-usage failed: " + ((stderr || "").trim() || "exit " + exitCode) }
+                    };
+                }
+                if (!record) {
+                    record = {
+                        provider: "claude",
+                        error: { message: "No Claude usage data. Run 'claude-usage --cli' once in a terminal." }
+                    };
+                }
+                done(record);
+            }), {
+                argv: [bin, "--cli"]
+            });
+        } catch (e) {
+            let fallback = this._recordFromMonitorCache();
+            done(fallback || { provider: "claude", error: { message: "Could not run claude-usage: " + e.message } });
+        }
+    }
+
+    _recordFromMonitorCache() {
+        // Cache-Format von claude-usage-tray: { ts, windows: [{ name,
+        // label, utilization, resets_at }], ... }. In die Struktur bringen,
+        // die _modelFromRecords erwartet: usage.primary = 5h-, secondary =
+        // 7d-Fenster.
+        try {
+            let path = GLib.get_home_dir() + CLAUDE_MONITOR_CACHE_PATH;
+            let file = Gio.File.new_for_path(path);
+
+            if (!file.query_exists(null)) {
+                return null;
+            }
+
+            let [ok, contents] = file.load_contents(null);
+            if (!ok) {
+                return null;
+            }
+
+            let text = contents instanceof Uint8Array
+                ? imports.byteArray.toString(contents)
+                : String(contents);
+
+            let cache = JSON.parse(text);
+
+            let windows = {};
+            let list = cache.windows || [];
+            for (let i = 0; i < list.length; i++) {
+                windows[list[i].name] = list[i];
+            }
+
+            // Zusaetzliche API-Fenster (z. B. 7-Day Opus/Sonnet/Cowork/OAuth
+            // Apps) werden generisch durchgereicht: Sobald Anthropic sie
+            // liefert, tauchen sie als eigene Zeilen im Popup auf, ohne dass
+            // hier etwas nachgebaut werden muss.
+            let extras = [];
+            for (let i = 0; i < list.length; i++) {
+                let w = list[i];
+                if (w.name === "five_hour" || w.name === "seven_day") {
+                    continue;
+                }
+                if (w.utilization === null || w.utilization === undefined) {
+                    continue;
+                }
+                extras.push({
+                    title: w.label || w.name,
+                    usedPercent: w.utilization,
+                    resetsAt: w.resets_at || null
+                });
+            }
+
+            let toWindow = function(window) {
+                if (!window || window.utilization === null || window.utilization === undefined) {
+                    return null;
+                }
+
+                let result = { usedPercent: window.utilization };
+                if (window.resets_at) {
+                    result.resetsAt = window.resets_at;
+                }
+                return result;
+            };
+
+            let age = cache.ts
+                ? Math.floor(Date.now() / 1000 - cache.ts)
+                : null;
+
+            let stale = age === null || age > CLAUDE_STALE_SECONDS;
+
+            // Alter offen ausweisen: stale heisst hier, der Live-Abruf ist
+            // fehlgeschlagen und der Ring zeigt den letzten bekannten Stand.
+            let source = "oauth api";
+            if (stale && age !== null) {
+                source = "oauth api · " + this._formatAge(age) + " alt";
+            }
+
+            return {
+                provider: "claude",
+                stale: stale,
+                ageSeconds: age,
+                source: source,
+                usage: {
+                    primary: toWindow(windows.five_hour),
+                    secondary: toWindow(windows.seven_day),
+                    extraRateWindows: extras,
+                    updatedAt: cache.ts
+                        ? new Date(cache.ts * 1000).toISOString()
+                        : null
+                }
+            };
+        } catch (e) {
+            return { provider: "claude", error: { message: "Could not parse Claude monitor cache: " + e.message } };
+        }
+    }
+
+    _formatAge(seconds) {
+        if (seconds < 60) {
+            return seconds + "s";
+        }
+        if (seconds < 3600) {
+            return Math.floor(seconds / 60) + "min";
+        }
+        let hours = Math.floor(seconds / 3600);
+        if (hours < 24) {
+            return hours + "h";
+        }
+        return Math.floor(hours / 24) + "d";
     }
 
     _buildMenu() {
         this.menu.removeAll();
 
-        let model = this._modelFromRecords(this.records);
-        this._addHeader(model);
-
-        if (model.error) {
-            this._addMessage(model.error, "codexbar-error");
-        } else if (model.rows.length === 0) {
+        if (this.records.length === 0) {
+            this._addHeader(this._modelFromRecords([]));
             this._addMessage("No usage data returned yet.", "codexbar-muted");
-        } else {
-            for (let i = 0; i < model.rows.length; i++) {
-                this._addUsageRow(model.rows[i]);
+            this._addSectionSeparator();
+            this._addActions();
+            return;
+        }
+
+        // Pro Provider ein eigener Block, damit beide Ringe im Panel eine
+        // erklaerende Entsprechung im Menue haben.
+        for (let i = 0; i < this.records.length; i++) {
+            if (i > 0) {
+                this._addSectionSeparator();
             }
-        }
 
-        if (model.extraUsage) {
-            this._addSectionSeparator();
-            this._addUsageRow(model.extraUsage);
-        }
+            let model = this._modelFromRecords([this.records[i]]);
+            this._addHeader(model, this._ringColorFor(this.records[i]));
 
-        if (model.costLines.length > 0) {
-            this._addSectionSeparator();
-            this._addCostSection(model.costLines);
+            if (model.error) {
+                this._addMessage(model.error, "codexbar-error");
+            } else if (model.rows.length === 0) {
+                this._addMessage("No usage data returned yet.", "codexbar-muted");
+            } else {
+                for (let r = 0; r < model.rows.length; r++) {
+                    this._addUsageRow(model.rows[r]);
+                }
+            }
+
+            if (model.extraUsage) {
+                this._addUsageRow(model.extraUsage);
+            }
+
+            if (model.costLines.length > 0) {
+                this._addCostSection(model.costLines);
+            }
+
+            // Veraltete Claude-Werte klar benennen: stale heisst jetzt, der
+            // Live-Abruf ueber claude-usage ist fehlgeschlagen (API oder Netz
+            // nicht erreichbar) - gezeigt wird der letzte bekannte Stand.
+            let record = this.records[i];
+            if (record && record.provider === "claude" && record.stale && !record.error) {
+                this._addMessage(
+                    "Wert ist " + this._formatAge(record.ageSeconds || 0)
+                        + " alt. Der Live-Abruf ueber claude-usage ist fehlgeschlagen;"
+                        + " gezeigt wird der letzte bekannte Stand.",
+                    "codexbar-muted");
+            }
         }
 
         this._addSectionSeparator();
         this._addActions();
     }
 
-    _addHeader(model) {
+    _ringColorFor(record) {
+        let name = record && record.provider ? record.provider : null;
+        let tint = name ? PROVIDER_TINTS[name] : null;
+        if (!tint) {
+            return null;
+        }
+
+        return "rgb(" + Math.round(tint[0] * 255) + ","
+            + Math.round(tint[1] * 255) + ","
+            + Math.round(tint[2] * 255) + ")";
+    }
+
+    _addHeader(model, ringColor) {
         let item = new PopupMenu.PopupBaseMenuItem({ reactive: false, style_class: "codexbar-popup-item" });
         let box = new St.BoxLayout({ vertical: true, style_class: "codexbar-card" });
         let top = new St.BoxLayout({ vertical: false });
         let title = new St.Label({ text: model.title, style_class: "codexbar-title" });
         let right = new St.Label({ text: model.headerRight, style_class: "codexbar-muted" });
+
+        // Farbpunkt in der Ringfarbe des Providers - stellt die Verbindung
+        // zwischen Panel-Ring und Menue-Block her.
+        if (ringColor) {
+            let dot = new St.Bin({ style_class: "codexbar-dot" });
+            dot.set_style("background-color: " + ringColor + ";");
+            top.add_actor(dot);
+        }
 
         title.x_expand = true;
         top.add_actor(title);
@@ -267,7 +656,7 @@ class CodexBarApplet extends Applet.TextIconApplet {
         let box = new St.BoxLayout({ vertical: true, style_class: "codexbar-row" });
         let titleLine = new St.BoxLayout({ vertical: false });
         let title = new St.Label({ text: row.title, style_class: "codexbar-row-title" });
-        let reset = new St.Label({ text: row.right || "", style_class: "codexbar-muted" });
+        let reset = new St.Label({ text: row.right || "", style_class: "codexbar-reset" });
 
         title.x_expand = true;
         titleLine.add_actor(title);
@@ -331,6 +720,14 @@ class CodexBarApplet extends Applet.TextIconApplet {
 
     _addActions() {
         let refreshItem = new PopupMenu.PopupIconMenuItem("Refresh now", "view-refresh", St.IconType.SYMBOLIC);
+        // Cinnamon schliesst das Menue bei jedem activate, es sei denn, das
+        // Item meldet keepMenu=true (so machen es die Submenue-Klassen).
+        // Beim Refresh soll das Menue offen bleiben, damit das Ergebnis
+        // direkt sichtbar wird - _setRecords baut es mit neuen Werten um.
+        refreshItem.activate = function(event) {
+            PopupMenu.PopupBaseMenuItem.prototype.activate.call(this, event, true);
+        };
+        refreshItem.label.add_style_class_name("codexbar-action");
         refreshItem.connect("activate", Lang.bind(this, this._onRefreshClicked));
         this.menu.addMenuItem(refreshItem);
 
@@ -417,13 +814,11 @@ class CodexBarApplet extends Applet.TextIconApplet {
             rows.push(this._limitRow("Weekly", secondary));
         }
 
+        // Zusaetzliche Fenster (aktuell nur von der Claude-OAuth-API geliefert,
+        // z. B. 7-Day Opus/Cowork) als normale Limit-Zeilen darstellen.
         let windows = this._getPath(record, ["usage", "extraRateWindows"]) || [];
         for (let i = 0; i < windows.length; i++) {
-            let title = windows[i].title || "Usage";
-            let lower = title.toLowerCase();
-            if (lower.indexOf("sonnet") >= 0) {
-                rows.push(this._paceRow("Sonnet", windows[i]));
-            }
+            rows.push(this._limitRow(windows[i].title || "Usage", windows[i]));
         }
 
         let reviewRemaining = this._deepFind(record, "codeReviewRemaining");
@@ -639,7 +1034,13 @@ class CodexBarApplet extends Applet.TextIconApplet {
     _tooltip(provider, rows, extraUsage) {
         let parts = [provider];
         for (let i = 0; i < rows.length; i++) {
-            parts.push(rows[i].title + ": " + rows[i].detail);
+            // right enthaelt die Reset-Angabe ("Resets ..."); ohne sie sagt der
+            // Tooltip nur den Prozentwert, ohne Bezug wann das Fenster kippt.
+            let line = rows[i].title + ": " + rows[i].detail;
+            if (rows[i].right) {
+                line += " · " + rows[i].right;
+            }
+            parts.push(line);
         }
         if (extraUsage) {
             parts.push(extraUsage.title + ": " + extraUsage.detail);

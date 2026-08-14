@@ -1,8 +1,17 @@
 .codexbar-panel-gauge {
-    width: 28px;
-    height: 16px;
+    width: 30px;
+    height: 18px;
     margin-left: 3px;
     margin-right: 1px;
+}
+
+/* Farbpunkt vor dem Provider-Namen, eingefaerbt wie der zugehoerige Ring. */
+.codexbar-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 5px;
+    margin-right: 7px;
+    margin-top: 6px;
 }
 
 .codexbar-popup-item {
@@ -19,9 +28,15 @@
     font-weight: bold;
 }
 
+/* Textfarben kommen NICHT aus festen Werten: das Applet misst zur Laufzeit
+   die Helligkeit des Menuehintergrunds und setzt am Menue-Container die
+   Klasse codexbar-on-light bzw. codexbar-on-dark. Ergebnis: auf hellen
+   Themes satt schwarze, auf dunklen satt weisse Schrift - das geerbte
+   Mittelgrau von Mint-X wird damit umgangen. */
 .codexbar-subtitle,
 .codexbar-detail {
     font-size: 12px;
+    font-weight: 500;
 }
 
 .codexbar-row-title {
@@ -29,13 +44,41 @@
     font-weight: bold;
 }
 
+.codexbar-reset {
+    font-size: 12px;
+    font-weight: 600;
+}
+
 .codexbar-muted {
-    color: rgba(255, 255, 255, 0.62);
-    font-size: 11px;
+    font-size: 12px;
 }
 
 .codexbar-error {
-    color: #ff8f8f;
+    color: #c0392b;
+    font-weight: bold;
+}
+
+/* Die eigentliche Farbsetzung: volle Deckkraft Schwarz auf hellem,
+   Weiss auf dunklem Menuehintergrund. Die Klasse am Container steuert
+   Titel, Zeilen, Details, Reset-Angaben, Zeitstempel und Aktionen. */
+.codexbar-on-light .codexbar-title,
+.codexbar-on-light .codexbar-subtitle,
+.codexbar-on-light .codexbar-row-title,
+.codexbar-on-light .codexbar-detail,
+.codexbar-on-light .codexbar-reset,
+.codexbar-on-light .codexbar-muted,
+.codexbar-on-light .codexbar-action {
+    color: #000000;
+}
+
+.codexbar-on-dark .codexbar-title,
+.codexbar-on-dark .codexbar-subtitle,
+.codexbar-on-dark .codexbar-row-title,
+.codexbar-on-dark .codexbar-detail,
+.codexbar-on-dark .codexbar-reset,
+.codexbar-on-dark .codexbar-muted,
+.codexbar-on-dark .codexbar-action {
+    color: #ffffff;
 }
 
 .codexbar-progress-track {
@@ -43,7 +86,7 @@
     margin-top: 6px;
     margin-bottom: 6px;
     border-radius: 4px;
-    background-color: rgba(255, 255, 255, 0.14);
+    background-color: rgba(128, 128, 128, 0.35);
 }
 
 .codexbar-progress-fill {
