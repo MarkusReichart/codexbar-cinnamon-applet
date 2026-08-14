@@ -137,6 +137,20 @@ class CodexBarApplet extends Applet.TextIconApplet {
         }
     }
 
+    // Baut das Menue um, ohne es dabei zu schliessen: Cinnamon's
+    // PopupMenuManager schliesst ein offenes Menue, wenn das Schluessel-
+    // fokussierte Item zerstoert wird (_onKeyFocusChanged). Genau das passiert
+    // beim Klick auf "Refresh now": der Klick fokussiert das Item, der
+    // Rebuild zerstoert es, der Manager schliesst. Deshalb den Fokus vor dem
+    // Rebuild auf den Menue-Container ziehen - der bleibt bestehen.
+    _rebuildMenu() {
+        if (this.menu.isOpen) {
+            this.menu.actor.can_focus = true;
+            this.menu.actor.grab_key_focus();
+        }
+        this._buildMenu();
+    }
+
     _onSettingsChanged() {
         this.commandPath = this.commandPath || DEFAULT_COMMAND;
         this.provider = this.provider || DEFAULT_PROVIDER;
@@ -199,7 +213,7 @@ class CodexBarApplet extends Applet.TextIconApplet {
         this.set_applet_tooltip(tooltipParts.length > 0
             ? tooltipParts.join("\n\n")
             : "CodexBar: waiting for data");
-        this._buildMenu();
+        this._rebuildMenu();
     }
 
     _setErrorState(message) {
@@ -208,7 +222,7 @@ class CodexBarApplet extends Applet.TextIconApplet {
         this.panelRings = [{ percent: 100, mode: "error", tint: null }];
         this._setPanelGauge(100, "error");
         this.set_applet_tooltip("CodexBar: " + this.lastError);
-        this._buildMenu();
+        this._rebuildMenu();
     }
 
     _setPanelGauge(percent, mode) {
@@ -328,7 +342,7 @@ class CodexBarApplet extends Applet.TextIconApplet {
     _refresh(manual) {
         if (this.refreshing) {
             if (manual && this.menu.isOpen) {
-                this._buildMenu();
+                this._rebuildMenu();
             }
             return;
         }
@@ -336,7 +350,7 @@ class CodexBarApplet extends Applet.TextIconApplet {
         this.refreshing = true;
         this.set_applet_tooltip("CodexBar: refreshing");
         if (this.menu.isOpen) {
-            this._buildMenu();
+            this._rebuildMenu();
         }
 
         let providers = this._selectedProviders();
