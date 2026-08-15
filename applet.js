@@ -892,7 +892,7 @@ class CodexBarApplet extends Applet.TextIconApplet {
         if (resetDescription) {
             right = "Resets " + resetDescription;
         } else if (reset) {
-            right = "Resets " + this._relativeTime(reset);
+            right = this._resetLabel(reset);
         }
 
         return {
@@ -916,7 +916,7 @@ class CodexBarApplet extends Applet.TextIconApplet {
             title: title,
             percent: percent || 0,
             detail: detail,
-            right: reset ? "Resets " + this._relativeTime(reset) : "",
+            right: reset ? this._resetLabel(reset) : "",
             note: summary || this._paceNote(stage, delta)
         };
     }
@@ -1127,6 +1127,20 @@ class CodexBarApplet extends Applet.TextIconApplet {
 
     _formatUpdated(date) {
         return date ? date.toLocaleTimeString() : "never";
+    }
+
+    _resetLabel(reset) {
+        // Reset-Zeitpunkt in der Vergangenheit heisst: die gezeigten Prozente
+        // gehoeren zu einem bereits geschlossenen Fenster (z. B. Cache von
+        // gestern nach dem Booten). "Resets in 0m" waere hier irrefuehrend.
+        let date = new Date(reset);
+        if (isNaN(date.getTime())) {
+            return "Resets " + String(reset);
+        }
+        if (date.getTime() <= Date.now()) {
+            return "Reset abgelaufen";
+        }
+        return "Resets " + this._relativeTime(reset);
     }
 
     _relativeTime(value) {
