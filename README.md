@@ -2,19 +2,19 @@
 
 > **Fork variant (branch `markus-variant`):** dual-provider version showing
 > **Claude and Codex** as two concentric panel gauges. Claude usage comes from
-> [claude-usage-tray](https://pypi.org/project/claude-usage-tray/) (`pipx
-> install claude-usage-tray`), which queries Anthropic's OAuth usage API
-> directly — so it counts every client (Claude Code, Claude Desktop, editor
-> plugins), not just terminal statusline sessions. The applet runs
-> `claude-usage --cli` on each refresh and reads its JSON cache at
-> `~/.claude/usage-monitor-cache.json`. It never touches
-> `~/.claude/.credentials.json` itself; the tool handles the token.
+> the CodexBar CLI itself via `codexbar usage --provider claude --source oauth`
+> — the explicit OAuth source reads `~/.claude/.credentials.json` and queries
+> Anthropic's usage API directly, so it counts every client (Claude Code,
+> Claude Desktop, editor plugins). The explicit flag is required on Linux:
+> CodexBar's auto pipeline fails there (Web cookies are macOS-only, and the
+> CLI PTY fallback returns only a subscription notice without quota numbers
+> for some accounts).
 >
 > Other changes vs. upstream: provider order Claude-first (the 5-hour window
 > is the critical one), runtime contrast detection (menu background luminance
 > is measured, text renders solid black or white — works on light and dark
 > themes), "Refresh now" keeps the menu open, tooltips include reset times,
-> and stale Claude values are shown as stale instead of silently aging.
+> and expired reset timestamps are shown as such instead of "Resets in 0m".
 >
 > The text below is the original upstream README.
 

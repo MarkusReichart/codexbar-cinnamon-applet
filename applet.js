@@ -7,8 +7,6 @@ const St = imports.gi.St;
 const Util = imports.misc.util;
 const AppletManager = imports.ui.appletManager;
 const Cairo = imports.cairo;
-const GLib = imports.gi.GLib;
-const Gio = imports.gi.Gio;
 
 const DEFAULT_COMMAND = "/opt/apps/codexbar/codexbar";
 const DEFAULT_PROVIDER = "both";
@@ -32,18 +30,11 @@ const PROVIDER_TINTS = {
 // Ab diesem Fuellstand wird das Bogenende zusaetzlich in Ampelfarbe markiert.
 const WARN_THRESHOLD = 0.85;
 
-// Claude-Live-Werte liefert claude-usage-tray (pipx): das Tool liest den
-// OAuth-Token aus ~/.claude/.credentials.json und fragt die Anthropic-API
-// direkt ab - damit zaehlt jeder Client (Code, Desktop, Copilot), nicht nur
-// die Terminal-Statusline. "claude-usage --cli" schreibt das Ergebnis als
-// JSON nach ~/.claude/usage-monitor-cache.json; das Applet startet den Abruf
-// und liest anschliessend diesen Cache.
-const CLAUDE_USAGE_BIN = "/.local/bin/claude-usage";
-const CLAUDE_MONITOR_CACHE_PATH = "/.claude/usage-monitor-cache.json";
-
-// Ab diesem Alter des Caches gilt der Live-Abruf als fehlgeschlagen und der
-// Ring wird halbtransparent gezeichnet.
-const CLAUDE_STALE_SECONDS = 600;
+// Beide Provider kommen ueber die CodexBar-CLI. Fuer Claude muss die Quelle
+// explizit "oauth" sein: die Auto-Pipeline scheitert unter Linux (Web-Cookies
+// sind macOS-only, der PTY-Fallback liefert bei manchen Accounts nur einen
+// Subscription-Hinweis ohne Quota-Zahlen). Der OAuth-Pfad liest
+// ~/.claude/.credentials.json selbst und fragt api.anthropic.com direkt.
 
 class CodexBarApplet extends Applet.TextIconApplet {
     constructor(metadata, orientation, panelHeight, instanceId) {
@@ -385,17 +376,10 @@ class CodexBarApplet extends Applet.TextIconApplet {
 
         for (let i = 0; i < providers.length; i++) {
             let name = providers[i];
-            if (name === "claude") {
-                this._readClaudeRecord(function(record) {
-                    collected[name] = record;
-                    finish();
-                });
-            } else {
-                this._readCliRecord(name, function(record) {
-                    collected[name] = record;
-                    finish();
-                });
-            }
+            this._readCliRecord(name, function(record) {
+                collected[name] = record;
+                finish();
+            });
         }
     }
 
@@ -417,174 +401,31 @@ class CodexBarApplet extends Applet.TextIconApplet {
                     done({ provider: providerName, error: { message: "Could not parse CodexBar JSON: " + e.message } });
                 }
             }), {
-                argv: [
-                    this.commandPath || DEFAULT_COMMAND,
-                    "usage",
-                    "--format",
-                    "json",
-                    "--provider",
-                    providerName
-                ]
+                argv: this._usageArgv(providerName)
             });
         } catch (e) {
             done({ provider: providerName, error: { message: "Could not run CodexBar: " + e.message } });
         }
     }
 
-    _readClaudeRecord(done) {
-        // "claude-usage --cli" holt frische Werte von der Anthropic-OAuth-API
-        // und schreibt sie in den Monitor-Cache. Die Textausgabe des Befehls
-        // ignorieren wir; gelesen wird anschliessend die Cache-Datei. So
-        // bekommt das Applet maschinenlesbares JSON statt formatierten Text.
-        let bin = GLib.get_home_dir() + CLAUDE_USAGE_BIN;
-        try {
-            Util.spawnCommandLineAsyncIO(null, Lang.bind(this, function(stdout, stderr, exitCode) {
-                let record = this._recordFromMonitorCache();
+    _usageArgv(providerName) {
+        let argv = [
+            this.commandPath || DEFAULT_COMMAND,
+            "usage",
+            "--format",
+            "json",
+            "--provider",
+            providerName
+        ];
 
-                // Grund des Fehlers sichtbar machen statt nur "fehlgeschlagen":
-                // claude-usage meldet API-Probleme im Klartext ("Rate Limits:
-                // unavailable - sign in ..."); exit != 0 liefert stderr.
-                // Gepackt als fetchIssue, das Popup nennt den Grund dann.
-                let issue = null;
-                let output = String(stdout || "");
-                if (output.indexOf("Rate Limits: unavailable") >= 0) {
-                    issue = "claude-usage meldet Anmeldung/API-Fehler";
-                } else if (exitCode !== 0) {
-                    issue = ((stderr || "").trim() || "exit " + exitCode);
-                }
-
-                if (record && issue) {
-                    record.fetchIssue = issue;
-                }
-
-                if (!record && issue) {
-                    record = {
-                        provider: "claude",
-                        error: { message: "claude-usage failed: " + issue }
-                    };
-                }
-                if (!record) {
-                    record = {
-                        provider: "claude",
-                        error: { message: "No Claude usage data. Run 'claude-usage --cli' once in a terminal." }
-                    };
-                }
-                done(record);
-            }), {
-                argv: [bin, "--cli"]
-            });
-        } catch (e) {
-            let fallback = this._recordFromMonitorCache();
-            done(fallback || { provider: "claude", error: { message: "Could not run claude-usage: " + e.message } });
+        // Claude: Auto-Pipeline scheitert unter Linux (Web-Cookies sind
+        // macOS-only, PTY-Fallback ohne Quota-Zahlen) - explizit OAuth,
+        // liest ~/.claude/.credentials.json und fragt die API direkt.
+        if (providerName === "claude") {
+            argv.push("--source", "oauth");
         }
-    }
 
-    _recordFromMonitorCache() {
-        // Cache-Format von claude-usage-tray: { ts, windows: [{ name,
-        // label, utilization, resets_at }], ... }. In die Struktur bringen,
-        // die _modelFromRecords erwartet: usage.primary = 5h-, secondary =
-        // 7d-Fenster.
-        try {
-            let path = GLib.get_home_dir() + CLAUDE_MONITOR_CACHE_PATH;
-            let file = Gio.File.new_for_path(path);
-
-            if (!file.query_exists(null)) {
-                return null;
-            }
-
-            let [ok, contents] = file.load_contents(null);
-            if (!ok) {
-                return null;
-            }
-
-            let text = contents instanceof Uint8Array
-                ? imports.byteArray.toString(contents)
-                : String(contents);
-
-            let cache = JSON.parse(text);
-
-            let windows = {};
-            let list = cache.windows || [];
-            for (let i = 0; i < list.length; i++) {
-                windows[list[i].name] = list[i];
-            }
-
-            // Zusaetzliche API-Fenster (z. B. 7-Day Opus/Sonnet/Cowork/OAuth
-            // Apps) werden generisch durchgereicht: Sobald Anthropic sie
-            // liefert, tauchen sie als eigene Zeilen im Popup auf, ohne dass
-            // hier etwas nachgebaut werden muss.
-            let extras = [];
-            for (let i = 0; i < list.length; i++) {
-                let w = list[i];
-                if (w.name === "five_hour" || w.name === "seven_day") {
-                    continue;
-                }
-                if (w.utilization === null || w.utilization === undefined) {
-                    continue;
-                }
-                extras.push({
-                    title: w.label || w.name,
-                    usedPercent: w.utilization,
-                    resetsAt: w.resets_at || null
-                });
-            }
-
-            let toWindow = function(window) {
-                if (!window || window.utilization === null || window.utilization === undefined) {
-                    return null;
-                }
-
-                let result = { usedPercent: window.utilization };
-                if (window.resets_at) {
-                    result.resetsAt = window.resets_at;
-                }
-                return result;
-            };
-
-            let age = cache.ts
-                ? Math.floor(Date.now() / 1000 - cache.ts)
-                : null;
-
-            let stale = age === null || age > CLAUDE_STALE_SECONDS;
-
-            // Alter offen ausweisen: stale heisst hier, der Live-Abruf ist
-            // fehlgeschlagen und der Ring zeigt den letzten bekannten Stand.
-            let source = "oauth api";
-            if (stale && age !== null) {
-                source = "oauth api · " + this._formatAge(age) + " alt";
-            }
-
-            return {
-                provider: "claude",
-                stale: stale,
-                ageSeconds: age,
-                source: source,
-                usage: {
-                    primary: toWindow(windows.five_hour),
-                    secondary: toWindow(windows.seven_day),
-                    extraRateWindows: extras,
-                    updatedAt: cache.ts
-                        ? new Date(cache.ts * 1000).toISOString()
-                        : null
-                }
-            };
-        } catch (e) {
-            return { provider: "claude", error: { message: "Could not parse Claude monitor cache: " + e.message } };
-        }
-    }
-
-    _formatAge(seconds) {
-        if (seconds < 60) {
-            return seconds + "s";
-        }
-        if (seconds < 3600) {
-            return Math.floor(seconds / 60) + "min";
-        }
-        let hours = Math.floor(seconds / 3600);
-        if (hours < 24) {
-            return hours + "h";
-        }
-        return Math.floor(hours / 24) + "d";
+        return argv;
     }
 
     _buildMenu() {
@@ -624,19 +465,6 @@ class CodexBarApplet extends Applet.TextIconApplet {
 
             if (model.costLines.length > 0) {
                 this._addCostSection(model.costLines);
-            }
-
-            // Veraltete Claude-Werte klar benennen: stale heisst jetzt, der
-            // Live-Abruf ueber claude-usage ist fehlgeschlagen (API oder Netz
-            // nicht erreichbar) - gezeigt wird der letzte bekannte Stand.
-            let record = this.records[i];
-            if (record && record.provider === "claude" && record.stale && !record.error) {
-                this._addMessage(
-                    "Wert ist " + this._formatAge(record.ageSeconds || 0)
-                        + " alt. Der Live-Abruf ueber claude-usage ist fehlgeschlagen"
-                        + (record.fetchIssue ? " (" + record.fetchIssue + ")" : "")
-                        + "; gezeigt wird der letzte bekannte Stand.",
-                    "codexbar-muted");
             }
         }
 
