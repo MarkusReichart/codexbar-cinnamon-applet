@@ -441,12 +441,26 @@ class CodexBarApplet extends Applet.TextIconApplet {
             Util.spawnCommandLineAsyncIO(null, Lang.bind(this, function(stdout, stderr, exitCode) {
                 let record = this._recordFromMonitorCache();
 
-                // Ein alter Cache ist besser als keiner: bei API-Fehler zeigt
-                // der Ring den letzten bekannten Stand, als stale markiert.
-                if (!record && exitCode !== 0) {
+                // Grund des Fehlers sichtbar machen statt nur "fehlgeschlagen":
+                // claude-usage meldet API-Probleme im Klartext ("Rate Limits:
+                // unavailable - sign in ..."); exit != 0 liefert stderr.
+                // Gepackt als fetchIssue, das Popup nennt den Grund dann.
+                let issue = null;
+                let output = String(stdout || "");
+                if (output.indexOf("Rate Limits: unavailable") >= 0) {
+                    issue = "claude-usage meldet Anmeldung/API-Fehler";
+                } else if (exitCode !== 0) {
+                    issue = ((stderr || "").trim() || "exit " + exitCode);
+                }
+
+                if (record && issue) {
+                    record.fetchIssue = issue;
+                }
+
+                if (!record && issue) {
                     record = {
                         provider: "claude",
-                        error: { message: "claude-usage failed: " + ((stderr || "").trim() || "exit " + exitCode) }
+                        error: { message: "claude-usage failed: " + issue }
                     };
                 }
                 if (!record) {
@@ -619,8 +633,9 @@ class CodexBarApplet extends Applet.TextIconApplet {
             if (record && record.provider === "claude" && record.stale && !record.error) {
                 this._addMessage(
                     "Wert ist " + this._formatAge(record.ageSeconds || 0)
-                        + " alt. Der Live-Abruf ueber claude-usage ist fehlgeschlagen;"
-                        + " gezeigt wird der letzte bekannte Stand.",
+                        + " alt. Der Live-Abruf ueber claude-usage ist fehlgeschlagen"
+                        + (record.fetchIssue ? " (" + record.fetchIssue + ")" : "")
+                        + "; gezeigt wird der letzte bekannte Stand.",
                     "codexbar-muted");
             }
         }
