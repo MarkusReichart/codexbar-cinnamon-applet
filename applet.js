@@ -664,11 +664,11 @@ class CodexBarApplet extends Applet.TextIconApplet {
         let secondary = this._limitWindow(record, "secondary");
 
         if (primary) {
-            rows.push(this._limitRow("Session", primary));
+            rows.push(this._withPace(this._limitRow("Session", primary), this._getPath(record, ["pace", "primary"])));
         }
 
         if (secondary) {
-            rows.push(this._limitRow("Weekly", secondary));
+            rows.push(this._withPace(this._limitRow("Weekly", secondary), this._getPath(record, ["pace", "secondary"])));
         }
 
         // Zusaetzliche Fenster (aktuell nur von der Claude-OAuth-API geliefert,
@@ -690,6 +690,20 @@ class CodexBarApplet extends Applet.TextIconApplet {
         }
 
         return rows;
+    }
+
+    // Pace-Angabe der CLI ("22% in reserve | Expected 24% used | Lasts until
+    // reset") als Notiz unter der Limit-Zeile. Sagt mehr aus als der nackte
+    // Prozentwert: ob das Fenster bei gleichem Tempo reicht. Fehlt die Angabe
+    // (z. B. bei aelteren CLI-Versionen), bleibt die Zeile unveraendert.
+    _withPace(row, pace) {
+        if (pace) {
+            let note = pace.summary || this._paceNote(pace.stage, pace.deltaPercent);
+            if (note) {
+                row.note = note;
+            }
+        }
+        return row;
     }
 
     _gaugeLimitPercent(record) {
