@@ -692,16 +692,43 @@ class CodexBarApplet extends Applet.TextIconApplet {
         return rows;
     }
 
-    // Pace-Angabe der CLI ("22% in reserve | Expected 24% used | Lasts until
-    // reset") als Notiz unter der Limit-Zeile. Sagt mehr aus als der nackte
-    // Prozentwert: ob das Fenster bei gleichem Tempo reicht. Fehlt die Angabe
-    // (z. B. bei aelteren CLI-Versionen), bleibt die Zeile unveraendert.
+    // Pace-Angabe der CLI als kompakte Einzeiler-Notiz unter der Limit-Zeile.
+    // Die rohe Summary ("65% in reserve | Expected 67% used | Lasts until
+    // reset") ist fuer das 280px-Popup zu lang und bricht mitten in Phrasen
+    // um - deshalb kurz: "Pace: 65% Reserve · reicht bis Reset" bzw.
+    // "Pace: 5% Defizit · leer in 2d 20h". Schlaegt das Parsen fehl,
+    // bleibt die Langfassung.
     _withPace(row, pace) {
-        if (pace) {
-            let note = pace.summary || this._paceNote(pace.stage, pace.deltaPercent);
-            if (note) {
-                row.note = note;
+        if (!pace) {
+            return row;
+        }
+
+        let summary = String(pace.summary || "");
+        let amount = /(\d+)% in (reserve|deficit)/i.exec(summary);
+        let note = null;
+
+        if (amount) {
+            let amountText = amount[1] + "% " + (amount[2].toLowerCase() === "reserve" ? "Reserve" : "Defizit");
+            let outlook;
+
+            if (pace.willLastToReset) {
+                outlook = "reicht bis Reset";
+            } else {
+                // Die Restlaufzeit ("Runs out in 2d 18h") steckt nur in der
+                // Summary, nicht als eigenes Feld.
+                let runsOut = /Runs out in (.+)$/i.exec(summary);
+                outlook = runsOut ? "leer in " + runsOut[1].trim() : "reicht nicht bis Reset";
             }
+
+            note = "Pace: " + amountText + " · " + outlook;
+        } else if (summary) {
+            note = summary;
+        } else {
+            note = this._paceNote(pace.stage, pace.deltaPercent);
+        }
+
+        if (note) {
+            row.note = note;
         }
         return row;
     }
