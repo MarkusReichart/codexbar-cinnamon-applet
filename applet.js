@@ -11,6 +11,7 @@ const Cairo = imports.cairo;
 const DEFAULT_COMMAND = "/opt/apps/codexbar/codexbar";
 const DEFAULT_PROVIDER = "both";
 const DEFAULT_REFRESH_SECONDS = 60;
+const TRANSIENT_FAILURE_LIMIT = 3;
 const PANEL_GAUGE_WIDTH = 30;
 const PANEL_GAUGE_HEIGHT = 18;
 
@@ -61,6 +62,7 @@ class CodexBarApplet extends Applet.TextIconApplet {
         this.lastUpdated = null;
         this.lastError = null;
         this.records = [];
+        this.providerFailureCounts = {};
         this.panelPercent = 0;
         this.panelGaugeMode = "loading";
 
@@ -174,6 +176,12 @@ class CodexBarApplet extends Applet.TextIconApplet {
             let record = this.records[i];
             let name = record && record.provider ? record.provider : "unknown";
             let tint = PROVIDER_TINTS[name] || null;
+
+            if (record && record.waiting) {
+                rings.push({ percent: 0, mode: "loading", tint: tint });
+                tooltipParts.push(this._titleCase(name) + ": waiting for data");
+                continue;
+            }
 
             if (record && record.error) {
                 errors += 1;
@@ -363,7 +371,7 @@ class CodexBarApplet extends Applet.TextIconApplet {
             for (let i = 0; i < providers.length; i++) {
                 let record = collected[providers[i]];
                 if (record) {
-                    records.push(record);
+                    records.push(this._normalizeProviderRecord(providers[i], record));
                 }
             }
 
@@ -406,6 +414,31 @@ class CodexBarApplet extends Applet.TextIconApplet {
         } catch (e) {
             done({ provider: providerName, error: { message: "Could not run CodexBar: " + e.message } });
         }
+    }
+
+    // Direkt nach Start oder Resume kann der erste OAuth-Aufruf scheitern,
+    // obwohl der vorhandene Refresh-Token den naechsten Aufruf wieder
+    // ermoeglicht. Solche Einzelmeldungen sind noch kein belastbarer Login-
+    // Bedarf. Erst nach drei aufeinanderfolgenden Fehlern wird die originale
+    // CLI-Meldung angezeigt; ein erfolgreicher Abruf setzt den Zaehler zurueck.
+    _normalizeProviderRecord(providerName, record) {
+        if (!record || !record.error) {
+            this.providerFailureCounts[providerName] = 0;
+            return record;
+        }
+
+        let failures = Number(this.providerFailureCounts[providerName] || 0) + 1;
+        this.providerFailureCounts[providerName] = failures;
+
+        if (failures < TRANSIENT_FAILURE_LIMIT) {
+            return {
+                provider: providerName,
+                source: providerName === "claude" ? "oauth" : "auto",
+                waiting: true
+            };
+        }
+
+        return record;
     }
 
     _usageArgv(providerName) {
@@ -451,6 +484,8 @@ class CodexBarApplet extends Applet.TextIconApplet {
 
             if (model.error) {
                 this._addMessage(model.error, "codexbar-error");
+            } else if (model.waiting) {
+                this._addMessage("Please wait — no data available right now.", "codexbar-muted");
             } else if (model.rows.length === 0) {
                 this._addMessage("No usage data returned yet.", "codexbar-muted");
             } else {
@@ -619,6 +654,22 @@ class CodexBarApplet extends Applet.TextIconApplet {
                 gaugePercent: 0,
                 tooltip: "CodexBar: waiting for data",
                 error: null,
+                waiting: true,
+                rows: [],
+                extraUsage: null,
+                costLines: []
+            };
+        }
+
+        if (record.waiting) {
+            return {
+                title: provider,
+                subtitle: "Waiting for data",
+                headerRight: "",
+                gaugePercent: 0,
+                tooltip: "CodexBar: waiting for data",
+                error: null,
+                waiting: true,
                 rows: [],
                 extraUsage: null,
                 costLines: []
@@ -634,6 +685,7 @@ class CodexBarApplet extends Applet.TextIconApplet {
                 gaugePercent: 100,
                 tooltip: "CodexBar: " + message,
                 error: message,
+                waiting: false,
                 rows: [],
                 extraUsage: null,
                 costLines: []
@@ -652,6 +704,7 @@ class CodexBarApplet extends Applet.TextIconApplet {
             gaugePercent: gaugePercent,
             tooltip: this._tooltip(provider, rows, extraUsage),
             error: null,
+            waiting: false,
             rows: rows,
             extraUsage: extraUsage,
             costLines: costLines
