@@ -127,6 +127,14 @@ class CodexBarApplet extends Applet.TextIconApplet {
         actor.remove_style_class_name("codexbar-on-dark");
         if (chosen) {
             actor.add_style_class_name(chosen);
+            // Warnfarbe fuer den Panel-Ring bei hoher Auslastung:
+            // Festrot war auf Claudes Orange unsichtbar. Kontrastfarbe
+            // (Schwarz auf hellen, Weiss auf dunklen Themes) funktioniert
+            // fuer beide Provider. Bei Messfehler Fallback Rot.
+            this._warnRGB = chosen === "codexbar-on-light" ? [0, 0, 0] : [1, 1, 1];
+            this.panelGauge.queue_repaint();
+        } else {
+            this._warnRGB = null;
         }
     }
 
@@ -280,24 +288,22 @@ class CodexBarApplet extends Applet.TextIconApplet {
         } else if (mode === "loading") {
             cr.setSourceRGBA(0.45, 0.65, 1, 0.8);
         } else {
-            // Der Fuellbogen traegt die Providerfarbe, nicht die Ampelfarbe:
-            // sonst sehen beide Ringe im gruenen Bereich identisch aus und die
-            // Zuordnung Codex/Claude geht verloren.
-            let color = ring.tint || this._usageColor(ratio);
+            // Bei hoher Auslastung (>= 85%) der gesamte Fuellbogen in der
+            // Warnfarbe statt der Providerfarbe - einheitlicher "Blackout"-
+            // Effekt, statt einer kurzen End-Markierung die auf Orange
+            // unsichtbar war. Die Warnfarbe kommt aus der Theme-Messung
+            // (Schwarz auf hellen, Weiss auf dunklen Themes).
+            let color;
+            if (ratio >= WARN_THRESHOLD) {
+                color = this._warnRGB || [0.96, 0.25, 0.20];
+            } else {
+                color = ring.tint || this._usageColor(ratio);
+            }
             cr.setSourceRGBA(color[0], color[1], color[2], mode === "stale" ? 0.5 : 1);
         }
 
         if (ratio > 0 || mode !== "normal") {
             cr.arc(cx, cy, radius, start, Math.max(start + 0.04, activeEnd));
-            cr.stroke();
-        }
-
-        // Auslastungswarnung als kurze Markierung am Bogenende, damit die
-        // Providerfarbe erhalten bleibt und hohe Werte trotzdem auffallen.
-        if (mode === "normal" && ratio >= WARN_THRESHOLD) {
-            let warn = this._usageColor(ratio);
-            cr.setSourceRGBA(warn[0], warn[1], warn[2], 1);
-            cr.arc(cx, cy, radius, Math.max(start, activeEnd - 0.28), activeEnd);
             cr.stroke();
         }
     }
