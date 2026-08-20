@@ -3,6 +3,7 @@ const Lang = imports.lang;
 const Mainloop = imports.mainloop;
 const PopupMenu = imports.ui.popupMenu;
 const Settings = imports.ui.settings;
+const Gio = imports.gi.Gio;
 const St = imports.gi.St;
 const Util = imports.misc.util;
 const AppletManager = imports.ui.appletManager;
@@ -65,6 +66,16 @@ class CodexBarApplet extends Applet.TextIconApplet {
         this.providerFailureCounts = {};
         this.panelPercent = 0;
         this.panelGaugeMode = "loading";
+
+        // Dieselbe 12/24-Stunden-Praeferenz verwenden wie Cinnamons
+        // Kalender-Applet. Falls das Schema auf einem anderen System fehlt,
+        // bleibt 24 Stunden der eindeutige Fallback.
+        this.desktopSettings = null;
+        try {
+            this.desktopSettings = new Gio.Settings({ schema_id: "org.cinnamon.desktop.interface" });
+        } catch (e) {
+            global.logWarning("CodexBar: clock-use-24h unavailable; using 24-hour time");
+        }
 
         this.panelGauge = new St.DrawingArea({ style_class: "codexbar-panel-gauge" });
         this.panelGauge.set_size(PANEL_GAUGE_WIDTH, PANEL_GAUGE_HEIGHT);
@@ -832,10 +843,13 @@ class CodexBarApplet extends Applet.TextIconApplet {
         let reset = this._firstValue(value, ["resetsAt", "resetAt", "reset_at"]);
         let right = "";
 
-        if (resetDescription) {
-            right = "Resets " + resetDescription;
-        } else if (reset) {
+        // resetDescription kommt von der CLI bereits fest im 12-Stunden-
+        // Format. Den maschinenlesbaren Zeitstempel deshalb bevorzugen und
+        // selbst gemaess Cinnamons Uhr-Einstellung formatieren.
+        if (reset) {
             right = this._resetLabel(reset);
+        } else if (resetDescription) {
+            right = "Resets " + resetDescription;
         }
 
         return {
@@ -1065,11 +1079,44 @@ class CodexBarApplet extends Applet.TextIconApplet {
         if (seconds < 3600) {
             return Math.floor(seconds / 60) + "m ago";
         }
-        return date.toLocaleTimeString();
+        return this._formatClockTime(date, true);
     }
 
     _formatUpdated(date) {
-        return date ? date.toLocaleTimeString() : "never";
+        return date ? this._formatClockTime(date, true) : "never";
+    }
+
+    _uses24HourClock() {
+        try {
+            return this.desktopSettings
+                ? this.desktopSettings.get_boolean("clock-use-24h")
+                : true;
+        } catch (e) {
+            return true;
+        }
+    }
+
+    _formatClockTime(date, includeSeconds) {
+        let hours = date.getHours();
+        let minutes = String(date.getMinutes()).padStart(2, "0");
+        let seconds = String(date.getSeconds()).padStart(2, "0");
+        let suffix = "";
+
+        if (this._uses24HourClock()) {
+            hours = String(hours).padStart(2, "0");
+        } else {
+            suffix = hours >= 12 ? " PM" : " AM";
+            hours = String(hours % 12 || 12);
+        }
+
+        return hours + ":" + minutes + (includeSeconds ? ":" + seconds : "") + suffix;
+    }
+
+    _formatResetDate(date) {
+        let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+        return months[date.getMonth()] + " " + date.getDate() + " at "
+            + this._formatClockTime(date, false);
     }
 
     _resetLabel(reset) {
@@ -1083,28 +1130,9 @@ class CodexBarApplet extends Applet.TextIconApplet {
         if (date.getTime() <= Date.now()) {
             return "Reset abgelaufen";
         }
-        return "Resets " + this._relativeTime(reset);
+        return "Resets " + this._formatResetDate(date);
     }
 
-    _relativeTime(value) {
-        let date = new Date(value);
-        if (isNaN(date.getTime())) {
-            return String(value);
-        }
-
-        let minutes = Math.max(0, Math.floor((date.getTime() - Date.now()) / 60000));
-        let days = Math.floor(minutes / 1440);
-        let hours = Math.floor((minutes % 1440) / 60);
-        let mins = minutes % 60;
-
-        if (days > 0) {
-            return "in " + days + "d " + hours + "h";
-        }
-        if (hours > 0) {
-            return "in " + hours + "h " + mins + "m";
-        }
-        return "in " + mins + "m";
-    }
 }
 
 function main(metadata, orientation, panelHeight, instanceId) {
