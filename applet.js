@@ -13,6 +13,18 @@ const DEFAULT_COMMAND = "/opt/apps/codexbar/codexbar";
 const DEFAULT_PROVIDER = "both";
 const DEFAULT_REFRESH_SECONDS = 60;
 const TRANSIENT_FAILURE_LIMIT = 3;
+
+// Der Claude-Client, der den Refresh-Token einloesen kann. "auth status" ist
+// nicht-interaktiv, gibt JSON aus und erneuert dabei ein abgelaufenes
+// Access-Token still - genau das, was ein Start von Claude Code sonst
+// nebenbei erledigt.
+const CLAUDE_CLI = "claude";
+const CLAUDE_AUTH_ARGV = [CLAUDE_CLI, "auth", "status", "--json"];
+
+// Nach einem erzwungenen Refresh nicht sofort erneut nachfassen: sonst
+// laeuft bei dauerhaft totem Refresh-Token bei jedem Zyklus ein
+// Prozessstart mit. Ein Versuch pro Zeitfenster reicht.
+const AUTH_RECOVERY_COOLDOWN_SECONDS = 300;
 const PANEL_GAUGE_WIDTH = 30;
 const PANEL_GAUGE_HEIGHT = 18;
 
@@ -37,6 +49,14 @@ const WARN_THRESHOLD = 0.85;
 // sind macOS-only, der PTY-Fallback liefert bei manchen Accounts nur einen
 // Subscription-Hinweis ohne Quota-Zahlen). Der OAuth-Pfad liest
 // ~/.claude/.credentials.json selbst und fragt api.anthropic.com direkt.
+//
+// Die CodexBar-CLI liest den Token dabei nur - sie loest den Refresh-Token
+// nicht ein. Ist das Access-Token abgelaufen (typisch nach Suspend oder
+// laengerer Pause), meldet sie deshalb "expired, run claude login", obwohl
+// der Refresh-Token noch gueltig ist und ein beliebiger Claude-Start das
+// Token still erneuert haette. Genau diese Erneuerung stoesst das Applet bei
+// einem Auth-Fehler selbst an (_recoverClaudeAuth) und wiederholt danach den
+// Abruf. Erst wenn auch das scheitert, ist der Login-Hinweis berechtigt.
 
 class CodexBarApplet extends Applet.TextIconApplet {
     constructor(metadata, orientation, panelHeight, instanceId) {
@@ -64,6 +84,7 @@ class CodexBarApplet extends Applet.TextIconApplet {
         this.lastError = null;
         this.records = [];
         this.providerFailureCounts = {};
+        this.lastAuthRecoveryAt = 0;
         this.panelPercent = 0;
         this.panelGaugeMode = "loading";
 
@@ -408,28 +429,97 @@ class CodexBarApplet extends Applet.TextIconApplet {
         }
     }
 
-    _readCliRecord(providerName, done) {
+    _readCliRecord(providerName, done, isRetry) {
         try {
             Util.spawnCommandLineAsyncIO(null, Lang.bind(this, function(stdout, stderr, exitCode) {
                 let output = (stdout || "").trim();
+                let record;
 
                 if (!output && stderr) {
-                    done({ provider: providerName, error: { message: "CodexBar failed: " + stderr.trim() } });
+                    record = { provider: providerName, error: { message: "CodexBar failed: " + stderr.trim() } };
+                } else {
+                    try {
+                        let parsed = JSON.parse(output || "[]");
+                        let list = Array.isArray(parsed) ? parsed : [parsed];
+                        record = list.length > 0 ? list[0] : { provider: providerName, error: { message: "No data returned." } };
+                    } catch (e) {
+                        record = { provider: providerName, error: { message: "Could not parse CodexBar JSON: " + e.message } };
+                    }
+                }
+
+                // Abgelaufenes Access-Token: einmal den Claude-Client den
+                // Refresh-Token einloesen lassen und den Abruf wiederholen.
+                // isRetry verhindert eine Endlosschleife, wenn auch der
+                // zweite Versuch scheitert.
+                if (!isRetry && providerName === "claude" && this._isAuthError(record)) {
+                    this._recoverClaudeAuth(Lang.bind(this, function(recovered) {
+                        if (recovered) {
+                            this._readCliRecord(providerName, done, true);
+                        } else {
+                            done(record);
+                        }
+                    }));
                     return;
                 }
 
-                try {
-                    let parsed = JSON.parse(output || "[]");
-                    let list = Array.isArray(parsed) ? parsed : [parsed];
-                    done(list.length > 0 ? list[0] : { provider: providerName, error: { message: "No data returned." } });
-                } catch (e) {
-                    done({ provider: providerName, error: { message: "Could not parse CodexBar JSON: " + e.message } });
-                }
+                done(record);
             }), {
                 argv: this._usageArgv(providerName)
             });
         } catch (e) {
             done({ provider: providerName, error: { message: "Could not run CodexBar: " + e.message } });
+        }
+    }
+
+    // Ein Auth-Fehler ist an der Wortwahl der CLI-Meldung erkennbar; ein
+    // Netzfehler oder ein Parserproblem darf keinen Refresh ausloesen.
+    _isAuthError(record) {
+        if (!record || !record.error || !record.error.message) {
+            return false;
+        }
+
+        let message = String(record.error.message).toLowerCase();
+        return message.indexOf("expired") >= 0
+            || message.indexOf("claude login") >= 0
+            || message.indexOf("unauthorized") >= 0
+            || message.indexOf("credentials") >= 0;
+    }
+
+    // Ruft "claude auth status --json" auf. Der Client erneuert dabei ein
+    // abgelaufenes Access-Token ueber den Refresh-Token. Das Applet fasst
+    // ~/.claude/.credentials.json bewusst nicht selbst an.
+    _recoverClaudeAuth(done) {
+        let now = Date.now();
+
+        if (this.lastAuthRecoveryAt && (now - this.lastAuthRecoveryAt) < AUTH_RECOVERY_COOLDOWN_SECONDS * 1000) {
+            done(false);
+            return;
+        }
+
+        this.lastAuthRecoveryAt = now;
+
+        try {
+            Util.spawnCommandLineAsyncIO(null, Lang.bind(this, function(stdout, stderr, exitCode) {
+                let loggedIn = false;
+
+                try {
+                    let status = JSON.parse((stdout || "").trim() || "{}");
+                    loggedIn = status.loggedIn === true;
+                } catch (e) {
+                    loggedIn = false;
+                }
+
+                if (!loggedIn) {
+                    global.logWarning("CodexBar: Claude token refresh failed; login required");
+                }
+
+                done(loggedIn);
+            }), {
+                argv: CLAUDE_AUTH_ARGV
+            });
+        } catch (e) {
+            global.logWarning("CodexBar: could not run claude auth status: " + e.message);
+            done(false);
         }
     }
 
