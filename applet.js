@@ -111,6 +111,11 @@ class CodexBarApplet extends Applet.TextIconApplet {
 
         this._setLoadingState();
         this._buildMenu();
+        // Die Warnfarbe bereits beim Applet-Start aus dem Theme ableiten.
+        // Sonst bleibt sie bis zum ersten Oeffnen des Popups undefiniert und
+        // der >=85%-Bogen erscheint nach einem Cinnamon-Neustart rot statt
+        // kontrastierend schwarz beziehungsweise weiss.
+        this._applyContrastClass();
         this._refresh();
         this._scheduleRefresh();
     }
