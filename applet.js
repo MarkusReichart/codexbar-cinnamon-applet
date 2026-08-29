@@ -666,7 +666,9 @@ class CodexBarApplet extends Applet.TextIconApplet {
         titleLine.add_actor(title);
         titleLine.add_actor(reset);
         box.add_actor(titleLine);
-        box.add_actor(this._progressBar(row.percent));
+        if (row.showProgress !== false) {
+            box.add_actor(this._progressBar(row.percent));
+        }
 
         let detailLine = new St.BoxLayout({ vertical: false });
         let detail = new St.Label({ text: row.detail || "", style_class: "codexbar-detail" });
@@ -843,6 +845,11 @@ class CodexBarApplet extends Applet.TextIconApplet {
             rows.push(this._limitRow(windows[i].title || "Usage", windows[i]));
         }
 
+        let resetCreditRows = this._resetCreditRows(record);
+        for (let i = 0; i < resetCreditRows.length; i++) {
+            rows.push(resetCreditRows[i]);
+        }
+
         let reviewRemaining = this._deepFind(record, "codeReviewRemaining");
         if (reviewRemaining !== null && reviewRemaining !== undefined) {
             rows.push({
@@ -855,6 +862,58 @@ class CodexBarApplet extends Applet.TextIconApplet {
         }
 
         return rows;
+    }
+
+    // Gespeicherte Limit-Zuruecksetzungen sind einloesbare Guthaben und
+    // deshalb keine weitere Prozentanzeige. Titel und Geltungsbereich kommen
+    // aus der CLI; bei mehreren Guthaben wird das frueheste Ablaufdatum
+    // angezeigt.
+    _resetCreditRows(record) {
+        let resetCredits = this._getPath(record, ["usage", "codexResetCredits"]);
+        if (!resetCredits) {
+            return [];
+        }
+
+        let credits = Array.isArray(resetCredits.credits) ? resetCredits.credits : [];
+        let availableCredits = [];
+        for (let i = 0; i < credits.length; i++) {
+            if (String(credits[i].status || "").toLowerCase() === "available") {
+                availableCredits.push(credits[i]);
+            }
+        }
+
+        let availableCount = this._firstNumber(resetCredits, ["availableCount", "available_count"]);
+        if (availableCount === null) {
+            availableCount = availableCredits.length;
+        }
+        if (availableCount <= 0) {
+            return [];
+        }
+
+        let credit = availableCredits.length > 0 ? availableCredits[0] : {};
+        let earliestExpiry = null;
+        for (let i = 0; i < availableCredits.length; i++) {
+            let value = this._firstValue(availableCredits[i], ["expires_at", "expiresAt"]);
+            let date = value ? new Date(value) : null;
+            if (date && !isNaN(date.getTime()) && (!earliestExpiry || date.getTime() < earliestExpiry.getTime())) {
+                earliestExpiry = date;
+                credit = availableCredits[i];
+            }
+        }
+
+        let rawTitle = String(credit.title || "Full reset");
+        let scope = /\(([^)]+)\)\s*$/.exec(rawTitle);
+        let title = rawTitle.replace(/\s*\([^)]+\)\s*$/, "") || "Full reset";
+        let detail = availableCount + " available" + (scope ? " · " + scope[1] : "");
+
+        return [{
+            title: title,
+            percent: 0,
+            detail: detail,
+            right: earliestExpiry ? "Expires " + this._formatResetDate(earliestExpiry) : "",
+            note: "",
+            showProgress: false
+        }];
     }
 
     // Pace-Angabe der CLI als kompakte Einzeiler-Notiz unter der Limit-Zeile.
