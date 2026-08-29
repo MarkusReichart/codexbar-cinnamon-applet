@@ -1047,6 +1047,11 @@ class CodexBarApplet extends Applet.TextIconApplet {
             return null;
         }
 
+        let remainingNumber = Number(remaining);
+        if (remaining !== null && !isNaN(remainingNumber) && remainingNumber <= 0) {
+            return null;
+        }
+
         let detail = "Remaining: " + this._displayValue(remaining);
         if (used !== null || limit !== null) {
             detail = "This month: " + this._displayValue(used || 0) + " / " + this._displayValue(limit || remaining);
