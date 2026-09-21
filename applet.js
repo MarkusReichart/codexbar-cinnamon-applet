@@ -4,6 +4,7 @@ const Mainloop = imports.mainloop;
 const PopupMenu = imports.ui.popupMenu;
 const Settings = imports.ui.settings;
 const Gio = imports.gi.Gio;
+const GLib = imports.gi.GLib;
 const St = imports.gi.St;
 const Util = imports.misc.util;
 const AppletManager = imports.ui.appletManager;
@@ -14,16 +15,18 @@ const DEFAULT_PROVIDER = "both";
 const DEFAULT_REFRESH_SECONDS = 60;
 const TRANSIENT_FAILURE_LIMIT = 3;
 
-// Der Claude-Client, der den Refresh-Token einloesen kann. "auth status" ist
-// nicht-interaktiv, gibt JSON aus und erneuert dabei ein abgelaufenes
-// Access-Token still - genau das, was ein Start von Claude Code sonst
-// nebenbei erledigt.
+// Der interaktive Claude-Start erneuert ein abgelaufenes Access-Token bereits
+// vor der ersten Modellanfrage. Ueber "script" bekommt Claude dafuer ein
+// Pseudoterminal; "timeout" beendet den unbenutzten Client wieder, ohne einen
+// Prompt zu senden oder ein 5h-Nutzungsfenster zu starten.
 const CLAUDE_CLI = "claude";
-const CLAUDE_AUTH_ARGV = [CLAUDE_CLI, "auth", "status", "--json"];
+const SCRIPT_CLI = "script";
+const TIMEOUT_CLI = "timeout";
+const CLAUDE_START_TIMEOUT_SECONDS = 15;
 
-// Nach einem erzwungenen Refresh nicht sofort erneut nachfassen: sonst
-// laeuft bei dauerhaft totem Refresh-Token bei jedem Zyklus ein
-// Prozessstart mit. Ein Versuch pro Zeitfenster reicht.
+// Nach einem erfolgreich bestaetigten Refresh nicht sofort erneut nachfassen.
+// Fehlgeschlagene Versuche setzen den Zeitstempel bewusst nicht, damit ein
+// voruebergehender Start- oder Netzfehler keinen weiteren Versuch blockiert.
 const AUTH_RECOVERY_COOLDOWN_SECONDS = 300;
 const PANEL_GAUGE_WIDTH = 30;
 const PANEL_GAUGE_HEIGHT = 18;
@@ -85,6 +88,7 @@ class CodexBarApplet extends Applet.TextIconApplet {
         this.records = [];
         this.providerFailureCounts = {};
         this.lastAuthRecoveryAt = 0;
+        this.authRecoveryInProgress = false;
         this.panelPercent = 0;
         this.panelGaugeMode = "loading";
 
@@ -459,7 +463,12 @@ class CodexBarApplet extends Applet.TextIconApplet {
                 if (!isRetry && providerName === "claude" && this._isAuthError(record)) {
                     this._recoverClaudeAuth(Lang.bind(this, function(recovered) {
                         if (recovered) {
-                            this._readCliRecord(providerName, done, true);
+                            this._readCliRecord(providerName, Lang.bind(this, function(retryRecord) {
+                                if (retryRecord && !retryRecord.error) {
+                                    this.lastAuthRecoveryAt = Date.now();
+                                }
+                                done(retryRecord);
+                            }), true);
                         } else {
                             done(record);
                         }
@@ -490,40 +499,60 @@ class CodexBarApplet extends Applet.TextIconApplet {
             || message.indexOf("credentials") >= 0;
     }
 
-    // Ruft "claude auth status --json" auf. Der Client erneuert dabei ein
-    // abgelaufenes Access-Token ueber den Refresh-Token. Das Applet fasst
+    // Startet Claude ohne Eingabe kurz in einem Pseudoterminal. Schon die
+    // Initialisierung erneuert ein abgelaufenes Access-Token; eine
+    // Modellanfrage findet nicht statt. Das Applet fasst
     // ~/.claude/.credentials.json bewusst nicht selbst an.
     _recoverClaudeAuth(done) {
         let now = Date.now();
+
+        if (this.authRecoveryInProgress) {
+            done(false);
+            return;
+        }
 
         if (this.lastAuthRecoveryAt && (now - this.lastAuthRecoveryAt) < AUTH_RECOVERY_COOLDOWN_SECONDS * 1000) {
             done(false);
             return;
         }
 
-        this.lastAuthRecoveryAt = now;
+        let claudePath = GLib.find_program_in_path(CLAUDE_CLI);
+        let scriptPath = GLib.find_program_in_path(SCRIPT_CLI);
+        let timeoutPath = GLib.find_program_in_path(TIMEOUT_CLI);
+
+        if (!claudePath || !scriptPath || !timeoutPath) {
+            global.logWarning("CodexBar: Claude token refresh unavailable; required command not found");
+            done(false);
+            return;
+        }
+
+        let claudeCommand = GLib.shell_quote(claudePath);
+        let argv = [
+            timeoutPath,
+            "--signal=INT",
+            "--kill-after=2",
+            String(CLAUDE_START_TIMEOUT_SECONDS),
+            scriptPath,
+            "-qefc",
+            claudeCommand,
+            "/dev/null"
+        ];
+
+        this.authRecoveryInProgress = true;
 
         try {
             Util.spawnCommandLineAsyncIO(null, Lang.bind(this, function(stdout, stderr, exitCode) {
-                let loggedIn = false;
-
-                try {
-                    let status = JSON.parse((stdout || "").trim() || "{}");
-                    loggedIn = status.loggedIn === true;
-                } catch (e) {
-                    loggedIn = false;
-                }
-
-                if (!loggedIn) {
-                    global.logWarning("CodexBar: Claude token refresh failed; login required");
-                }
-
-                done(loggedIn);
+                this.authRecoveryInProgress = false;
+                // "timeout" beendet die absichtlich unbenutzte TUI meist mit
+                // 124 oder 137. Ob der Token erneuert wurde, entscheidet erst
+                // der anschliessende CodexBar-Abruf.
+                done(true);
             }), {
-                argv: CLAUDE_AUTH_ARGV
+                argv: argv
             });
         } catch (e) {
-            global.logWarning("CodexBar: could not run claude auth status: " + e.message);
+            this.authRecoveryInProgress = false;
+            global.logWarning("CodexBar: could not start Claude for token refresh: " + e.message);
             done(false);
         }
     }
