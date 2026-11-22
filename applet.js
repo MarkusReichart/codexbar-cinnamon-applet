@@ -47,6 +47,11 @@ const PROVIDER_TINTS = {
 // Ab diesem Fuellstand wird das Bogenende zusaetzlich in Ampelfarbe markiert.
 const WARN_THRESHOLD = 0.85;
 
+const WEEKLY_WINDOW_MINUTES = 7 * 24 * 60;
+const CLAUDE_FABLE_WINDOW_ID = "claude-weekly-scoped-fable";
+const CLAUDE_FABLE_WEEKLY_CAP_PERCENT = 50;
+const FABLE_FILL_STYLE = "background-color: #d97757;";
+
 // Beide Provider kommen ueber die CodexBar-CLI. Fuer Claude muss die Quelle
 // explizit "oauth" sein: die Auto-Pipeline scheitert unter Linux (Web-Cookies
 // sind macOS-only, der PTY-Fallback liefert bei manchen Accounts nur einen
@@ -696,7 +701,7 @@ class CodexBarApplet extends Applet.TextIconApplet {
         titleLine.add_actor(reset);
         box.add_actor(titleLine);
         if (row.showProgress !== false) {
-            box.add_actor(this._progressBar(row.percent));
+            box.add_actor(this._progressBar(row.percent, row.fableShare, row.isFable));
         }
 
         let detailLine = new St.BoxLayout({ vertical: false });
@@ -718,7 +723,7 @@ class CodexBarApplet extends Applet.TextIconApplet {
         this.menu.addMenuItem(item);
     }
 
-    _progressBar(percent) {
+    _progressBar(percent, fableShare, isFable) {
         let numericPercent = Number(percent || 0);
         let clamped = Math.max(0, Math.min(100, numericPercent));
         if (Math.round(clamped) === 100) {
@@ -727,11 +732,32 @@ class CodexBarApplet extends Applet.TextIconApplet {
 
         let track = new St.BoxLayout({ style_class: "codexbar-progress-track" });
         let fill = new St.Bin({ style_class: "codexbar-progress-fill" });
+        if (isFable) {
+            fill.set_style(FABLE_FILL_STYLE);
+        }
+
+        // Fable is already included in the total: color part of the fill,
+        // without extending the bar.
+        let fableFill = null;
+        if (fableShare > 0) {
+            fableFill = new St.Bin({
+                style_class: "codexbar-progress-fill",
+                style: FABLE_FILL_STYLE,
+                x_align: St.Align.START
+            });
+            fill.set_child(fableFill);
+        }
+
         let updateFillWidth = function () {
             let trackWidth = track.get_width();
             let fillWidth = Math.round((trackWidth * clamped) / 100);
 
             fill.set_width(clamped > 0 ? Math.max(3, fillWidth) : 0);
+            if (fableFill) {
+                let fableWidth = Math.round((trackWidth * Math.min(fableShare, clamped)) / 100);
+                fableFill.set_width(fableWidth);
+                fableFill.visible = fableWidth > 0;
+            }
         };
 
         track.x_expand = true;
@@ -856,22 +882,41 @@ class CodexBarApplet extends Applet.TextIconApplet {
 
     _usageRows(record) {
         let rows = [];
-        let primary = this._limitWindow(record, "primary");
-        let secondary = this._limitWindow(record, "secondary");
+        let { session, weekly } = this._mainLimitWindows(record);
+        let sessionPace = this._getPath(record, ["pace", "primary"]);
+        let weeklyPace = this._getPath(record, ["pace", "secondary"]);
 
-        if (primary) {
-            rows.push(this._withPace(this._limitRow("Session", primary), this._getPath(record, ["pace", "primary"])));
+        if (session) {
+            rows.push(this._withPace(this._limitRow("Session", session), sessionPace));
         }
 
-        if (secondary) {
-            rows.push(this._withPace(this._limitRow("Weekly", secondary), this._getPath(record, ["pace", "secondary"])));
+        let weeklyRow = null;
+        if (weekly) {
+            weeklyRow = this._withPace(this._limitRow("Weekly", weekly), weeklyPace || (!session && sessionPace));
+            rows.push(weeklyRow);
         }
 
-        // Zusaetzliche Fenster (aktuell nur von der Claude-OAuth-API geliefert,
-        // z. B. 7-Day Opus/Cowork) als normale Limit-Zeilen darstellen.
-        let windows = this._getPath(record, ["usage", "extraRateWindows"]) || [];
-        for (let i = 0; i < windows.length; i++) {
-            rows.push(this._limitRow(windows[i].title || "Usage", windows[i]));
+        let windows = this._getPath(record, ["usage", "extraRateWindows"]);
+        if (Array.isArray(windows)) {
+            for (let item of windows) {
+                if (!item) {
+                    continue;
+                }
+
+                // The CLI puts the quota and reset inside .window. Older
+                // flat records are still supported.
+                let value = item.window || item;
+                let row = this._limitRow(item.title || "Usage", value);
+                if (record.provider === "claude" && item.id === CLAUDE_FABLE_WINDOW_ID) {
+                    row.isFable = true;
+                    row.note = "Up to " + CLAUDE_FABLE_WEEKLY_CAP_PERCENT + "% of the weekly limit";
+                    if (weeklyRow && weeklyRow.showProgress !== false && row.showProgress !== false) {
+                        let share = Math.max(0, Math.min(100, row.percent)) * CLAUDE_FABLE_WEEKLY_CAP_PERCENT / 100;
+                        weeklyRow.fableShare = Math.max(0, Math.min(weeklyRow.percent, share));
+                    }
+                }
+                rows.push(row);
+            }
         }
 
         let resetCreditRows = this._resetCreditRows(record);
@@ -987,15 +1032,27 @@ class CodexBarApplet extends Applet.TextIconApplet {
     }
 
     _gaugeLimitPercent(record) {
-        let primary = this._limitWindow(record, "primary");
-        let percent = primary ? this._firstNumber(primary, ["usedPercent", "percentUsed", "usagePercent", "used_percent"]) : null;
+        let { session, weekly } = this._mainLimitWindows(record);
+        let keys = ["usedPercent", "percentUsed", "usagePercent", "used_percent"];
+        let percent = this._firstNumber(session, keys);
         if (percent !== null) {
             return percent;
         }
 
-        let secondary = this._limitWindow(record, "secondary");
-        percent = secondary ? this._firstNumber(secondary, ["usedPercent", "percentUsed", "usagePercent", "used_percent"]) : null;
+        percent = this._firstNumber(weekly, keys);
         return percent === null ? 0 : percent;
+    }
+
+    _mainLimitWindows(record) {
+        let primary = this._limitWindow(record, "primary");
+        let secondary = this._limitWindow(record, "secondary");
+        // With no 5h limit (verified Ultra), the CLI can promote the
+        // weekly window to primary while still emitting it as secondary.
+        if (record.provider === "claude" && this._firstNumber(primary, ["windowMinutes"]) === WEEKLY_WINDOW_MINUTES) {
+            return { session: null, weekly: secondary || primary };
+        }
+
+        return { session: primary, weekly: secondary };
     }
 
     _limitWindow(record, name) {
@@ -1035,13 +1092,17 @@ class CodexBarApplet extends Applet.TextIconApplet {
             right = "Resets " + resetDescription;
         }
 
-        return {
+        let row = {
             title: title,
             percent: percent || 0,
-            detail: this._percentText(percent),
+            detail: percent === null ? "Usage unavailable" : this._percentText(percent),
             right: right,
             note: ""
         };
+        if (percent === null) {
+            row.showProgress = false;
+        }
+        return row;
     }
 
     _paceRow(title, value) {
